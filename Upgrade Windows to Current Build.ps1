@@ -138,14 +138,168 @@ function Clear-Alert {
     }
 }
 
-function Invoke-Reboot {
+function Process-Invoke-Reboot {
     if ($RebootAfterUpgrade) {
-        Write-Output "Reboot variable enabled, rebooting in $RebootDelay minutes."
-        # If Automatic Restart Sign-On is enabled, /g allows the device to automatically sign in and lock
-        # based on the last interactive user. After sign in, it restarts any registered applications.
-        shutdown /g /f /t $($RebootDelay * 60) /c $RebootWarningMessage
-        exit
+    $logFile = "C:\ProgramData\RebootPrompt.log"
+    $statusFile = "C:\ProgramData\RebootPromptStatus.txt"
+    $inputFile = "C:\ProgramData\RebootPromptInput.txt"
+    $userScript = "C:\ProgramData\RebootPrompt.ps1"
+
+    function Write-Invoke-Reboot-Log {
+        param($message)
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        "$timestamp - $message" | Out-File -FilePath $logFile -Append
+        Write-Host $message
     }
+
+    function Write-StatusFile {
+        param($status, $message)
+        "$status|$message" | Out-File -FilePath $statusFile -Force
+        Write-Invoke-Reboot-Log "Status file updated: $status - $message"
+    }
+
+    Write-Invoke-Reboot-Log "Invoke-Reboot function started"
+
+    # Create the user input script
+    $userScriptContent = @"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# Hide the PowerShell console window
+Add-Type -Name Window -Namespace Console -MemberDefinition '
+[DllImport("Kernel32.dll")]
+public static extern IntPtr GetConsoleWindow();
+[DllImport("user32.dll")]
+public static extern bool ShowWindow(IntPtr hWnd, Int32 nCmdShow);
+'
+[Console.Window]::ShowWindow([Console.Window]::GetConsoleWindow(), 0)
+
+# Calculate expiration time (30 minutes from now)
+`$expirationTime = (Get-Date).AddMinutes(30).ToString("dd/MM/yyyy HH:mm")
+
+`$form = New-Object System.Windows.Forms.Form
+`$form.Text = 'System Reboot Required'
+`$form.Size = New-Object System.Drawing.Size(450,250)
+`$form.StartPosition = 'CenterScreen'
+`$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+`$form.MaximizeBox = `$false
+`$form.MinimizeBox = `$false
+
+`$label = New-Object System.Windows.Forms.Label
+`$label.Location = New-Object System.Drawing.Point(10,20)
+`$label.Size = New-Object System.Drawing.Size(410,130)
+`$label.Text = "This device has received an important Security Update and must be rebooted.`n`nPlease either click OK to reboot in 30 minutes, or click REBOOT LATER, to skip the reboot.`n`nIf you choose to reboot later you must reboot the device before the end of the day.`n`nThis message expires `$expirationTime at which point the reboot will be automatically skipped and you must reboot at the end of the day."
+`$form.Controls.Add(`$label)
+
+`$okButton = New-Object System.Windows.Forms.Button
+`$okButton.Location = New-Object System.Drawing.Point(100,160)
+`$okButton.Size = New-Object System.Drawing.Size(100,30)
+`$okButton.Text = 'OK'
+`$okButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
+`$form.Controls.Add(`$okButton)
+
+`$laterButton = New-Object System.Windows.Forms.Button
+`$laterButton.Location = New-Object System.Drawing.Point(250,160)
+`$laterButton.Size = New-Object System.Drawing.Size(100,30)
+`$laterButton.Text = 'REBOOT LATER'
+`$laterButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+`$form.Controls.Add(`$laterButton)
+
+`$form.AcceptButton = `$okButton
+`$form.CancelButton = `$laterButton
+
+`$result = `$form.ShowDialog()
+
+if (`$result -eq [System.Windows.Forms.DialogResult]::OK) {
+    "OK" | Out-File -FilePath "$inputFile" -Force
+} elseif (`$result -eq [System.Windows.Forms.DialogResult]::Cancel) {
+    "LATER" | Out-File -FilePath "$inputFile" -Force
+} else {
+    "CLOSED" | Out-File -FilePath "$inputFile" -Force
+}
+"@
+
+    $userScriptContent | Out-File -FilePath $userScript -Force
+    Write-Invoke-Reboot-Log "User input script created at $userScript"
+
+    # Create and run the scheduled task
+    $taskName = "RebootPrompt"
+    $action = New-ScheduledTaskAction -Execute "Powershell.exe" -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$userScript`""
+    $trigger = New-ScheduledTaskTrigger -AtLogOn
+    $principal = New-ScheduledTaskPrincipal -GroupId "BUILTIN\Users" -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -Hidden
+
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force
+    Write-Invoke-Reboot-Log "Scheduled task '$taskName' created"
+
+    # Start the task
+    Start-ScheduledTask -TaskName $taskName
+    Write-Invoke-Reboot-Log "Scheduled task '$taskName' started"
+
+    # Wait for the input file to be created (max 5 minutes)
+    $timeout = 300
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    while (-not (Test-Path $inputFile) -and $timer.Elapsed.TotalSeconds -lt $timeout) {
+        Start-Sleep -Seconds 5
+    }
+    $timer.Stop()
+
+    if (-not (Test-Path $inputFile)) {
+        Write-Invoke-Reboot-Log "Timeout waiting for user input"
+        Write-StatusFile "ERROR" "Timeout waiting for user input"
+        return "TIMEOUT"
+    }
+
+    # Read the user input
+    $rebootChoice = Get-Content $inputFile -Raw
+    $rebootChoice = $rebootChoice.Trim()
+    Remove-Item $inputFile -Force
+    Write-Invoke-Reboot-Log "User reboot choice: $rebootChoice"
+
+    # Clean up
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+    Remove-Item $userScript -Force
+
+    # Return the user's choice
+    return $rebootChoice
+    }
+        else {
+            Write-host "RebootAfterUpgrade is not set to true. No action taken."
+        }
+}
+
+function Write-Invoke-Reboot-Log {
+    param($message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "$timestamp - $message" | Out-File -FilePath "C:\ProgramData\MainScript.log" -Append
+    Write-Host $message
+}
+
+function Invoke-Reboot {
+$rebootChoice = Process-Invoke-Reboot
+switch ($rebootChoice) {
+    "OK" {
+        Write-Invoke-Reboot-Log "User chose to reboot"
+        # Schedule reboot for 30 minutes from now
+        shutdown /g /f /t $($RebootDelay * 60) /c $RebootWarningMessage
+        Write-Invoke-Reboot-Log "Reboot scheduled for $($rebootTime.ToString('yyyy-MM-dd HH:mm:ss'))"
+    }
+    "LATER" {
+        Write-Invoke-Reboot-Log "User chose to reboot later"
+        # Handle this case as needed
+        # For example, you might set a flag to check again later
+    }
+    "CLOSED" {
+        Write-Invoke-Reboot-Log "User closed the prompt without making a selection"
+        # Handle this case as needed
+        # This might be treated the same as "LATER"
+    }
+    "TIMEOUT" {
+        Write-Invoke-Reboot-Log "Prompt timed out without user input"
+        # Handle this case as needed
+        # You might choose to force a reboot or try again later
+    }
+}
 }
 
 function Get-Download {
